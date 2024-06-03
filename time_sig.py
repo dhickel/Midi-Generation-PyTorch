@@ -36,6 +36,6 @@ def sort_midi_files(input_dir, output_dir):
             except Exception as e:
                 print(f"Failed to process {filename}: {str(e)}")
 
-input_dir = "data/split"  # Replace with your input directory
+input_dir = "/home/mindspice/code/Python/PycharmProjects/midi_generator/data/classical/archive/beeth"  # Replace with your input directory
 output_dir = "data/time_sig"  # Replace with your output directory
 sort_midi_files(input_dir, output_dir)
