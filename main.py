@@ -3,7 +3,7 @@ import random
 
 import torch
 from torch import nn, optim
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, OneCycleLR, LinearLR
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, OneCycleLR, LinearLR, ReduceLROnPlateau
 from torch.utils.data import random_split, DataLoader
 from data import MidiDataset, NoteData, NetworkData
 from focal_loss import FocalLoss, focal_loss
@@ -16,7 +16,7 @@ from model import EmbConvLstmAttn, EmbConvLstmAttnTest, EmbConvLstmAttnSimple, E
     EmbConvLstPoly2, MidiLSTM2D, MidiLSTM2DA, EmbConvLstPoly3, EmbConvLstPoly4, EmbConvLstPoly5, EmbConvLstPoly6, \
     EmbConvLstPoly7, EmbConvLstPoly8, EmbConvLstPoly65, EmbConvLstPoly655, EmbConvLstPoly656, NewSingleModel, \
     NewSingleModel2, EmbConvLstm, NewSingleModel3, NewSingleModel4, EmbConvLstPoly10, EmbConvLstPoly11, \
-    EmbConvLstPolyNew, SimpleLstm
+    EmbConvLstPolyNew, SimpleLstm, LSTMNew1, CustomLSTMWithAttention, CustomLSTMWithSelfAttention
 from train2 import get_notes, prepare_sequences, train, get_notes_single, evaluate
 from torch.cuda.amp import GradScaler
 
@@ -69,11 +69,11 @@ def main_train():
     load_checkpoint = False
     load_note = True
     prep_notes = False
-    model_name = 'classical-v9'
+    model_name = 'classical-CustomLSTMWithSelfAttention-NormNorm'
     notes_name = 'classical_single'
     model_dir = '/mnt/chia_raid/models'
     load_epoch = 100
-    batch_size = 128
+    batch_size = 192
     gen_interval = 10
     seq_len = 512
     skip_amt = 2
@@ -118,17 +118,18 @@ def main_train():
     alpha_values[129] = 0  # Lower weight for class 0 (padding)
 
     # Initialize the model
-    model = SimpleLstm(note_data, dropout=0.7, bidirectional=False)
+    model = CustomLSTMWithSelfAttention(note_data, dropout=0.3, bidirectional=True)
     model = model.to(device)
-    # criterion = nn.CrossEntropyLoss()
-    criterion = FocalLoss()
-    #optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.999), amsgrad=True)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, nesterov=True)
+    criterion = nn.CrossEntropyLoss()
+    #criterion = FocalLoss(gamma=2)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, betas=(0.9, 0.999))
+   # optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, nesterov=True)
     # Define the scheduler parameters
-    T_0 = 40  # Number of epochs before the first restart
-    T_mult = 1  # Multiplier for the number of epochs after each restart
-    eta_min = 0.005  # Minimum learning rate
+    T_0 = 10  # Number of epochs before the first restart
+    T_mult = 2  # Multiplier for the number of epochs after each restart
+    eta_min = 1e-5  # Minimum learning rate
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0, T_mult, eta_min=eta_min)
+ #   scheduler = ReduceLROnPlateau(optimizer, patience=4, cooldown=10, threshold=0.001, verbose=True)
     #scheduler = OneCycleLR(optimizer, base_momentum=0.85, max_momentum=0.95, max_lr=0.1, pct_start=0.2,
      #                      steps_per_epoch=len(train_dataloader), epochs=300)
    # scheduler = LinearLR(optimizer, start_factor=1, end_factor=1, last_epoch=1000)
@@ -164,14 +165,15 @@ def main_train():
         if epoch == 0 or (epoch + 1) % save_interval == 0:
             save_model(model, optimizer, scheduler, epoch, f'{model_dir}/{model_name}_checkpoint_epoch_{epoch + 1}.pth')
 
-        t_loss, t_acc = train(model, train_dataloader, criterion, optimizer, device, note_data, scaler, batch_size,
-                              scheduler=scheduler, clip_value=5)
-        v_loss, v_acc = evaluate(model, val_dataloader, criterion, device, note_data, batch_size)
+        t_loss, t_acc = train(model, train_dataloader, criterion, optimizer, device, batch_size,
+                              scheduler=None, clip_value=0.5) # FIXME None
+        v_loss, v_acc = evaluate(model, val_dataloader, criterion, device, batch_size)
         with open(f"models/{model_name}_training.txt", "a") as file:
             file.write(f"Epoch {epoch}: T_Lose: {t_loss}\tT_Acc: {t_acc} \t\tV_Lose: {v_loss}\tV_Acc: {v_acc}\n")
 
         print(f'Epoch {epoch + 1}/{epochs}')
         print(f"Train Loss:{t_loss:.4f} Train Acc:{t_acc}\t|\tValid Loss:{v_loss:.4f} Valid Acc:{v_acc}")
+        scheduler.step(epoch)
 
         # Generate test midi
         if (epoch + 1) % gen_interval == 0:

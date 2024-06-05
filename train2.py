@@ -160,10 +160,10 @@ def get_notes_single(directory, max_chan, get_flat=True):
                 except:
                     continue
 
-                if offset > 0:
-                    if step is not None:
-                        notes.append(step.get_step())
-                    step = Step(max_chan)
+                # if offset > 0:
+                #     if step is not None:
+                #         notes.append(step.get_step())
+                #     step = Step(max_chan)
 
                 if isinstance(event, note.Note):
                     # note_val = data.add_note_if_absent(str(event.pitch.nameWithOctave))
@@ -173,7 +173,7 @@ def get_notes_single(directory, max_chan, get_flat=True):
                     off_val = data.add_offs_if_absent(offset)
                     tup = (note_val, off_val, durr_val, vel_val)
                     if not any(item is None for item in tup):
-                        step.add_note(tup)
+                        notes.append(tup)
 
 
                 elif isinstance(event, chord.Chord):
@@ -186,7 +186,7 @@ def get_notes_single(directory, max_chan, get_flat=True):
                         off_val = data.add_offs_if_absent(offset)
                         tup = (note_val, off_val, durr_val, vel_val)
                         if not any(item is None for item in tup):
-                            step.add_note(tup)
+                            notes.append(tup)
 
                 prev_event_offset = event.offset
         data.training_notes.append(notes)
@@ -213,9 +213,41 @@ def get_notes_single(directory, max_chan, get_flat=True):
     return data
 
 
-def prepare_sequences(note_data, device=torch.device("cpu"), sequence_length=64, skip_amount=1):
-    sequence_length = sequence_length
+# def prepare_sequences(note_data, device=torch.device("cpu"), sequence_length=64, skip_amount=1):
+#     sequence_length = sequence_length
+#
+#     network_input = []
+#     network_output_notes = []
+#     network_output_offsets = []
+#     network_output_durations = []
+#     network_output_velocities = []
+#
+#     # create input sequences and the corresponding outputs
+#     for notes in note_data.training_notes:
+#         for i in range(0, len(notes) - sequence_length - 1, skip_amount):
+#             sequence_in = notes[i:i + sequence_length]
+#             sequence_out = notes[i + sequence_length]
+#             network_input.append([[x[0], x[1], x[2], x[3]] for x in sequence_in])
+#             network_output_notes.append(sequence_out[0])
+#             network_output_offsets.append(sequence_out[1])
+#             network_output_durations.append(sequence_out[2])
+#             network_output_velocities.append(sequence_out[3])
+#
+#     network_input = torch.tensor(network_input, dtype=torch.long).to(device)
+#     # Shape for cross_entropy: (N) where N is batch size.
+#     # network_output_notes = torch.tensor(network_output_notes, torch.long).view(-1).to(device)
+#     # network_output_offsets = torch.tensor(network_output_offsets, torch.long).view(-1).to(device)
+#     # network_output_durations = torch.tensor(network_output_durations, torch.long).view(-1).to(device)
+#     # network_output_velocities = torch.tensor(network_output_velocities, torch.long).view(-1).to(device)
+#     network_output_notes = torch.tensor(network_output_notes, dtype=torch.long).to(device)
+#     network_output_offsets = torch.tensor(network_output_offsets, dtype=torch.long).to(device)
+#     network_output_durations = torch.tensor(network_output_durations, dtype=torch.long).to(device)
+#     network_output_velocities = torch.tensor(network_output_velocities, dtype=torch.long).to(device)
+#     return NetworkData(network_input, network_output_notes, network_output_offsets, network_output_durations,
+#                        network_output_velocities)
 
+
+def prepare_sequences(note_data, device=torch.device("cuda"), sequence_length=64, skip_amount=1):
     network_input = []
     network_output_notes = []
     network_output_offsets = []
@@ -234,17 +266,12 @@ def prepare_sequences(note_data, device=torch.device("cpu"), sequence_length=64,
             network_output_velocities.append(sequence_out[3])
 
     network_input = torch.tensor(network_input, dtype=torch.long).to(device)
-    # Shape for cross_entropy: (N) where N is batch size.
-    # network_output_notes = torch.tensor(network_output_notes, torch.long).view(-1).to(device)
-    # network_output_offsets = torch.tensor(network_output_offsets, torch.long).view(-1).to(device)
-    # network_output_durations = torch.tensor(network_output_durations, torch.long).view(-1).to(device)
-    # network_output_velocities = torch.tensor(network_output_velocities, torch.long).view(-1).to(device)
     network_output_notes = torch.tensor(network_output_notes, dtype=torch.long).to(device)
     network_output_offsets = torch.tensor(network_output_offsets, dtype=torch.long).to(device)
     network_output_durations = torch.tensor(network_output_durations, dtype=torch.long).to(device)
     network_output_velocities = torch.tensor(network_output_velocities, dtype=torch.long).to(device)
-    return NetworkData(network_input, network_output_notes, network_output_offsets, network_output_durations,
-                       network_output_velocities)
+
+    return NetworkData(network_input, network_output_notes, network_output_offsets, network_output_durations, network_output_velocities)
 
 
 
@@ -1340,3 +1367,112 @@ def evaluate(model, val_loader, criterion, device, note_data, batch_size):
     accuracy = correct_predictions / total_predictions
 
     return (running_loss / len(val_loader.dataset)) / 4, accuracy
+
+
+
+def train(model, train_loader, criterion, optimizer, device, batch_size, scheduler=None, clip_value=None):
+    model.train()
+    running_loss = 0.0
+    total_predictions = 0
+    correct_predictions = 0
+
+    for inputs, (targets_note, targets_offset, targets_duration, targets_velocity) in tqdm(train_loader):
+        optimizer.zero_grad()
+        hidden = model.init_hidden(device, batch_size)
+
+        inputs = inputs.to(device)
+        targets_note = targets_note.to(device)
+        targets_offset = targets_offset.to(device)
+        targets_duration = targets_duration.to(device)
+        targets_velocity = targets_velocity.to(device)
+
+        # Forward pass
+        output_note, output_offset, output_duration, output_velocity, hidden = model(inputs, hidden)
+
+        # Element-wise loss for each feature
+        loss_note = criterion(output_note, targets_note)
+        loss_offset = criterion(output_offset, targets_offset)
+        loss_duration = criterion(output_duration, targets_duration)
+        loss_velocity = criterion(output_velocity, targets_velocity)
+
+        # Calculate accuracy
+        _, predicted_notes = torch.max(output_note.data, 1)
+        _, predicted_offsets = torch.max(output_offset.data, 1)
+        _, predicted_durations = torch.max(output_duration.data, 1)
+        _, predicted_velocities = torch.max(output_velocity.data, 1)
+
+        correct_predictions += (predicted_notes == targets_note).sum().item()
+        correct_predictions += (predicted_offsets == targets_offset).sum().item()
+        correct_predictions += (predicted_durations == targets_duration).sum().item()
+        correct_predictions += (predicted_velocities == targets_velocity).sum().item()
+
+        total_predictions += targets_note.numel()
+        total_predictions += targets_offset.numel()
+        total_predictions += targets_duration.numel()
+        total_predictions += targets_velocity.numel()
+
+        loss = loss_note + loss_offset + loss_duration + loss_velocity
+
+        # Backward pass and optimize
+        loss.backward()
+        if clip_value is not None:  # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
+        optimizer.step()
+
+        if scheduler is not None:
+            scheduler.step(loss)
+
+        running_loss += loss.item() * inputs.size(0)
+
+    accuracy = correct_predictions / total_predictions
+
+    return running_loss / len(train_loader.dataset), accuracy
+
+def evaluate(model, val_loader, criterion, device, batch_size):
+    model.eval()
+    running_loss = 0.0
+    total_predictions = 0
+    correct_predictions = 0
+
+    with torch.no_grad():
+        for inputs, (targets_note, targets_offset, targets_duration, targets_velocity) in tqdm(val_loader):
+            hidden = model.init_hidden(device, batch_size)
+
+            inputs = inputs.to(device)
+            targets_note = targets_note.to(device)
+            targets_offset = targets_offset.to(device)
+            targets_duration = targets_duration.to(device)
+            targets_velocity = targets_velocity.to(device)
+
+            # Forward pass
+            output_note, output_offset, output_duration, output_velocity, hidden = model(inputs, hidden)
+
+            # Element-wise loss for each feature
+            loss_note = criterion(output_note, targets_note).mean()
+            loss_offset = criterion(output_offset, targets_offset).mean()
+            loss_duration = criterion(output_duration, targets_duration).mean()
+            loss_velocity = criterion(output_velocity, targets_velocity).mean()
+
+            # Calculate accuracy
+            _, predicted_notes = torch.max(output_note.data, 1)
+            _, predicted_offsets = torch.max(output_offset.data, 1)
+            _, predicted_durations = torch.max(output_duration.data, 1)
+            _, predicted_velocities = torch.max(output_velocity.data, 1)
+
+            correct_predictions += (predicted_notes == targets_note).sum().item()
+            correct_predictions += (predicted_offsets == targets_offset).sum().item()
+            correct_predictions += (predicted_durations == targets_duration).sum().item()
+            correct_predictions += (predicted_velocities == targets_velocity).sum().item()
+
+            total_predictions += targets_note.numel()
+            total_predictions += targets_offset.numel()
+            total_predictions += targets_duration.numel()
+            total_predictions += targets_velocity.numel()
+
+            loss = loss_note + loss_offset + loss_duration + loss_velocity
+
+            running_loss += loss.item() * inputs.size(0)
+
+    accuracy = correct_predictions / total_predictions
+
+    return running_loss / len(val_loader.dataset), accuracy

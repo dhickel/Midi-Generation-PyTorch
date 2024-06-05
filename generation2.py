@@ -260,6 +260,66 @@ def add_uniform_noise(original, range_factor):
 #     return prediction_output
 
 
+# def generate_notes(model, note_data, network_data, device, seq_length=1200, seed=None, temperature=0.6):
+#     model.eval()
+#
+#     # If a seed sequence is provided, use it, else choose one randomly
+#     if seed is None:
+#         start = np.random.randint(0, len(network_data.input) - 1)
+#         pattern = network_data.input[start].unsqueeze(0).to(device)
+#
+#     else:
+#         pattern = seed.unsqueeze(0).to(device)
+#
+#     prediction_output = []
+#     hidden = model.init_hidden(device, batch_size=1)
+#     for note_index in range(seq_length):
+#         with torch.no_grad():
+#             prediction_note, prediction_offset, prediction_duration, prediction_velocity, hidden = model(pattern, hidden)
+#
+#         # Sample from the probability distribution of the predicted notes/offsets/durations/velocities
+#         next_input_features = []
+#
+#         # arrays to hold multiple feature elements for each feature
+#         notes = []
+#         offsets = []
+#         durations = []
+#         velocities = []
+#
+#         # loop over the elements of each feature
+#         for i in range(6):
+#             note_index = torch.multinomial(F.softmax(prediction_note[0, i, :] / temperature, dim=0), 1)
+#             offset_index = torch.multinomial(F.softmax(prediction_offset[0, i, :] / temperature, dim=0), 1)
+#             duration_index = torch.multinomial(F.softmax(prediction_duration[0, i, :] / temperature, dim=0), 1)
+#             velocity_index = torch.multinomial(F.softmax(prediction_velocity[0, i, :] / temperature, dim=0), 1)
+#
+#             note = note_data.get_note(note_index.item())
+#             offset = note_data.get_offset(offset_index.item())
+#             duration = note_data.get_duration(duration_index.item())
+#             velocity = note_data.get_velocity(velocity_index.item())
+#
+#             notes.append(note)
+#             offsets.append(offset)
+#             durations.append(duration)
+#             velocities.append(velocity)
+#
+#             next_input_feature = [note_index.item(), offset_index.item(), duration_index.item(), velocity_index.item()]
+#             next_input_features.append(next_input_feature)
+#
+#         result = (notes, offsets, durations, velocities)
+#         prediction_output.append(result)
+#
+#         next_input = torch.tensor([next_input_features], dtype=torch.long).to(device)
+#
+#         # Reshape next_input to match the dimensions of pattern before concatenation
+#         next_input = next_input.permute(0, 2, 1)
+#         next_input = next_input.unsqueeze(1)  # making it [1, 1, 4, 6]
+#
+#         pattern = torch.cat((pattern[:, 1:, :, :], next_input), dim=1)
+#
+#     return prediction_output
+
+
 def generate_notes(model, note_data, network_data, device, seq_length=1200, seed=None, temperature=0.6):
     model.eval()
 
@@ -267,58 +327,37 @@ def generate_notes(model, note_data, network_data, device, seq_length=1200, seed
     if seed is None:
         start = np.random.randint(0, len(network_data.input) - 1)
         pattern = network_data.input[start].unsqueeze(0).to(device)
-
     else:
         pattern = seed.unsqueeze(0).to(device)
 
     prediction_output = []
     hidden = model.init_hidden(device, batch_size=1)
+
     for note_index in range(seq_length):
         with torch.no_grad():
-            prediction_note, prediction_offset, prediction_duration, prediction_velocity, hidden = model(pattern, hidden)
+            prediction_note, prediction_offset, prediction_duration, prediction_velocity, hidden = model(pattern,
+                                                                                                         hidden)
 
         # Sample from the probability distribution of the predicted notes/offsets/durations/velocities
-        next_input_features = []
+        note_index = torch.multinomial(F.softmax(prediction_note[0, :] / temperature, dim=0), 1)
+        offset_index = torch.multinomial(F.softmax(prediction_offset[0, :] / temperature, dim=0), 1)
+        duration_index = torch.multinomial(F.softmax(prediction_duration[0, :] / temperature, dim=0), 1)
+        velocity_index = torch.multinomial(F.softmax(prediction_velocity[0, :] / temperature, dim=0), 1)
 
-        # arrays to hold multiple feature elements for each feature
-        notes = []
-        offsets = []
-        durations = []
-        velocities = []
+        note = note_data.get_note(note_index.item())
+        offset = note_data.get_offset(offset_index.item())
+        duration = note_data.get_duration(duration_index.item())
+        velocity = note_data.get_velocity(velocity_index.item())
 
-        # loop over the elements of each feature
-        for i in range(6):
-            note_index = torch.multinomial(F.softmax(prediction_note[0, i, :] / temperature, dim=0), 1)
-            offset_index = torch.multinomial(F.softmax(prediction_offset[0, i, :] / temperature, dim=0), 1)
-            duration_index = torch.multinomial(F.softmax(prediction_duration[0, i, :] / temperature, dim=0), 1)
-            velocity_index = torch.multinomial(F.softmax(prediction_velocity[0, i, :] / temperature, dim=0), 1)
-
-            note = note_data.get_note(note_index.item())
-            offset = note_data.get_offset(offset_index.item())
-            duration = note_data.get_duration(duration_index.item())
-            velocity = note_data.get_velocity(velocity_index.item())
-
-            notes.append(note)
-            offsets.append(offset)
-            durations.append(duration)
-            velocities.append(velocity)
-
-            next_input_feature = [note_index.item(), offset_index.item(), duration_index.item(), velocity_index.item()]
-            next_input_features.append(next_input_feature)
-
-        result = (notes, offsets, durations, velocities)
+        result = (note, offset, duration, velocity)
         prediction_output.append(result)
 
-        next_input = torch.tensor([next_input_features], dtype=torch.long).to(device)
+        next_input_feature = [note_index.item(), offset_index.item(), duration_index.item(), velocity_index.item()]
+        next_input = torch.tensor([next_input_feature], dtype=torch.long).unsqueeze(0).to(device)
 
-        # Reshape next_input to match the dimensions of pattern before concatenation
-        next_input = next_input.permute(0, 2, 1)
-        next_input = next_input.unsqueeze(1)  # making it [1, 1, 4, 6]
-
-        pattern = torch.cat((pattern[:, 1:, :, :], next_input), dim=1)
+        pattern = torch.cat((pattern[:, 1:, :], next_input), dim=1)
 
     return prediction_output
-
 
 def generate_notes_test( note_data, inputs,  seq_length=1200, seed=None, temperature=1):
 
@@ -446,54 +485,81 @@ def generate_notes_test( note_data, inputs,  seq_length=1200, seed=None, tempera
 #         return midi_stream
 
 
+# def create_midi_track(prediction_output, return_stream=False, output_file='output.mid'):
+#     output_notes = []
+#     total_offset = -1
+#
+#     last_notes = []
+#     last_offset = -1
+#     last_chord_offset = -1
+#
+#     inst = instrument.Instrument()
+#     inst.midiProgram = 81
+#
+#     # last_<x> is used to keep track of already playing notes as to not play them over each other in-humanly in edge
+#     # cases
+#     placement_offset = -1
+#     total_offset = 0
+#     for notes, offsets, durations, velocities in prediction_output:
+#
+#         if total_offset == -1:
+#             placement_offset = 0
+#         else:
+#             placement_offset = total_offset + offsets[0]
+#
+#         valid_step = False
+#         for i in range(len(notes)):
+#             if any(v is None for v in (notes[i], offsets[i], durations[i], velocities[i])):
+#                 continue
+#
+#             new_note = note.Note(midi=notes[i])
+#             new_note.offset = placement_offset
+#             new_note.duration = duration.Duration(durations[i])
+#             new_note.storedInstrument = inst
+#             new_note.volume.velocity = velocities[i]  # Add velocity
+#             output_notes.append(new_note)
+#             valid_step = True
+#
+#         if valid_step:
+#             total_offset = placement_offset
+#
+#     midi_stream = stream.Stream(output_notes)
+#
+#     midi_stream.write('midi', fp=output_file)
+#     if not return_stream:
+#         print("saved_track")
+#         midi_stream.write('midi', fp=output_file)
+#     else:
+#
+#         return midi_stream
+
 def create_midi_track(prediction_output, return_stream=False, output_file='output.mid'):
     output_notes = []
-    total_offset = -1
-
-    last_notes = []
-    last_offset = -1
-    last_chord_offset = -1
+    total_offset = 0
 
     inst = instrument.Instrument()
     inst.midiProgram = 81
 
-    # last_<x> is used to keep track of already playing notes as to not play them over each other in-humanly in edge
-    # cases
-    placement_offset = -1
-    total_offset = 0
-    for notes, offsets, durations, velocities in prediction_output:
+    for note_val, offset_val, duration_val, velocity_val in prediction_output:
+        if note_val is None or offset_val is None or duration_val is None or velocity_val is None:
+            continue
 
-        if total_offset == -1:
-            placement_offset = 0
-        else:
-            placement_offset = total_offset + offsets[0]
+        new_note = note.Note(midi=note_val)
+        new_note.offset = total_offset + offset_val
+        new_note.duration = duration.Duration(duration_val)
+        new_note.storedInstrument = inst
+        new_note.volume.velocity = velocity_val  # Add velocity
+        output_notes.append(new_note)
 
-        valid_step = False
-        for i in range(len(notes)):
-            if any(v is None for v in (notes[i], offsets[i], durations[i], velocities[i])):
-                continue
-
-            new_note = note.Note(midi=notes[i])
-            new_note.offset = placement_offset
-            new_note.duration = duration.Duration(durations[i])
-            new_note.storedInstrument = inst
-            new_note.volume.velocity = velocities[i]  # Add velocity
-            output_notes.append(new_note)
-            valid_step = True
-
-        if valid_step:
-            total_offset = placement_offset
+        total_offset += offset_val  # Update total_offset after appending the note
 
     midi_stream = stream.Stream(output_notes)
 
-    midi_stream.write('midi', fp=output_file)
     if not return_stream:
         print("saved_track")
         midi_stream.write('midi', fp=output_file)
     else:
-
         return midi_stream
-
 
 def create_midi_track_test(prediction_output, return_stream=False, output_file='output.mid'):
     output_notes = []
