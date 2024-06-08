@@ -156,6 +156,10 @@ def add_uniform_noise(original, range_factor):
 #
 #     return sequence
 
+def denormalize_data(data, min_val, max_val):
+    return int(((data + 1) / 2 * (max_val - min_val) + min_val))
+
+
 def generate_notes(model, note_data, network_data, device, seq_length=1200, seed=None, temperature=0.6):
     model.eval()
 
@@ -176,13 +180,13 @@ def generate_notes(model, note_data, network_data, device, seq_length=1200, seed
     hidden = model.init_hidden(device, 1)
     for note_index in range(seq_length):
         with torch.no_grad():
-            prediction_note, prediction_offset, prediction_duration, prediction_velocity, hidden = model(pattern, hidden)
+            prediction_note, prediction_offset, prediction_duration, prediction_velocity, hidden = model(pattern,
+                                                                                                         hidden)
 
         note_index = torch.multinomial(F.softmax(prediction_note / temperature, dim=1), 1)
         offset_index = torch.multinomial(F.softmax(prediction_offset / temperature, dim=1), 1)
         duration_index = torch.multinomial(F.softmax(prediction_duration / temperature, dim=1), 1)
         velocity_index = torch.multinomial(F.softmax(prediction_velocity / temperature, dim=1), 1)
-
 
         if note_index is None or note_index < 0 or note_index > len(note_data.note_table) - 1:
             print(f"Attempted to generate out of index note: {note_index}, table_len{note_data.note_table}")
@@ -201,6 +205,11 @@ def generate_notes(model, note_data, network_data, device, seq_length=1200, seed
             seq_length += 1
             continue
 
+        min_note, max_note = 0, note_data.n_vocab
+        min_offset, max_offset = 0, note_data.o_vocab
+        min_duration, max_duration = 0, note_data.d_vocab
+        min_velocity, max_velocity = 0, note_data.v_vocab
+
         note = note_data.get_note(note_index[0, 0].item())
         offset = note_data.get_offset(offset_index[0, 0].item())
         duration = note_data.get_duration(duration_index[0, 0].item())
@@ -208,7 +217,6 @@ def generate_notes(model, note_data, network_data, device, seq_length=1200, seed
 
         result = (note, offset, duration, velocity)
         prediction_output.append(result)
-
 
         # next_input = torch.tensor(
         #     [[[note_index.item(), offset_index.item(), duration_index.item(), velocity_index.item()]]],
@@ -337,7 +345,6 @@ def create_midi_track(prediction_output, return_stream=False, output_file='outpu
     else:
 
         return midi_stream
-
 
 
 def get_transpose_seed(note_data, seq_length, t_key, device, minor=False):

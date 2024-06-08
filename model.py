@@ -5519,20 +5519,20 @@ class EmbConvLstmNew(nn.Module):
 
 
 class PolyCNNLSTM(nn.Module):
-    def __init__(self, note_data, num_chan, dropout=0.3):
+    def __init__(self, note_data, num_chan=8, dropout=0.3, bidirectional=False):
         super(PolyCNNLSTM, self).__init__()
         pow2 = lambda n: 2 ** math.ceil(math.log(n, 2))
         self.note_data = note_data
         self.num_chan = num_chan
 
         self.embeddings = nn.ModuleList([
-            nn.Embedding(note_data.n_vocab, 64),
-            nn.Embedding(note_data.o_vocab, 64),
-            nn.Embedding(note_data.d_vocab, 64),
-            nn.Embedding(note_data.v_vocab, 64)]
+            nn.Embedding(note_data.n_vocab, 16),
+            nn.Embedding(note_data.o_vocab, 16),
+            nn.Embedding(note_data.d_vocab, 16),
+            nn.Embedding(note_data.v_vocab, 16)]
         )
 
-        self.e_size = 256 * num_chan
+        self.e_size = 64 * num_chan
         self.comp_size = pow2(self.e_size / num_chan)
         self.fc_encode = nn.Linear(self.e_size, self.comp_size)
         self.conv1 = nn.Conv1d(self.comp_size, self.comp_size * 2, kernel_size=1, padding=0)
@@ -5568,12 +5568,23 @@ class PolyCNNLSTM(nn.Module):
 
         self._initialize_weights()
 
+    def detach_hidden(self, hidden):
+        hidden, cell = hidden
+        hidden = hidden.detach()
+        cell = cell.detach()
+        return hidden, cell
+
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv1d) or isinstance(m, nn.Linear):
                 nn.init.kaiming_uniform_(m.weight, nonlinearity='leaky_relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+
+    def init_hidden(self, device, batch_size=160):
+        hidden = torch.zeros(2, batch_size, self.e_size * 10).to(device)
+        cell = torch.zeros(2, batch_size, self.e_size * 10).to(device)
+        return hidden, cell
 
     def forward(self, x):
         batch_size, seq_length, num_tuples, num_features = x.size()
@@ -7228,23 +7239,24 @@ class EmbConvLstPoly65(nn.Module):
 
         self.bidirectional = bidirectional
         self.note_data = note_data
-        self.embedding_size1 = 16
-        self.embedding_size2 = 16
-        self.embedding_size3 = 16
-        self.embedding_size4 = 16
+        self.embedding_size1 = 8
+        self.embedding_size2 = 8
+        self.embedding_size3 = 8
+        self.embedding_size4 = 8
 
         self.note_embedd = nn.Embedding(note_data.n_vocab, self.embedding_size1, padding_idx=0)
         self.offset_embedd = nn.Embedding(note_data.o_vocab, self.embedding_size2, padding_idx=0)
         self.duration_embedd = nn.Embedding(note_data.d_vocab, self.embedding_size3, padding_idx=0)
         self.velocity_embedd = nn.Embedding(note_data.v_vocab, self.embedding_size4, padding_idx=0)
-        self.comp_size = 16 * 4 * 4
+        self.comp_size = 8 * 4 * 4
 
-        self.note_encode = EmbEncode(16 * 6, 16 * 4)
-        self.offset_encode = EmbEncode(16 * 6, 16 * 4)
-        self.duration_encode = EmbEncode(16 * 6, 16 * 4)
-        self.velocity_encode = EmbEncode(16 * 6, 16 * 4)
-
-        self.embAttn = SelfAttentionImpr(16 * 4 * 4)
+        self.bn = nn.BatchNorm1d(8 * 4)
+        self.embAttn = SelfAttentionImpr(8 * 4)
+        self.dense = nn.Sequential(
+            nn.Linear(8 * 4, 8 * 4 * 4),
+            nn.Dropout(),
+            nn.ReLU()
+        )
 
         self.conv1 = nn.Conv1d(self.comp_size, self.comp_size * 1, kernel_size=1, padding=0)
         self.conv2 = nn.Conv1d(self.comp_size, self.comp_size * 1, kernel_size=3, padding=0)
@@ -7252,7 +7264,7 @@ class EmbConvLstPoly65(nn.Module):
         self.conv4 = nn.Conv1d(self.comp_size, self.comp_size * 1, kernel_size=8, padding=0)
 
         self.convAttn = SelfAttentionImpr(self.comp_size)
-        self.convGroup = nn.GroupNorm(32, self.comp_size)  # LayerNorm equivalent for 3D input
+        self.convGroup = nn.BatchNorm1d(self.comp_size)  # LayerNorm equivalent for 3D input
         self.convAttn2 = SelfAttentionImpr(self.comp_size)
         self.lstm = nn.LSTM(self.comp_size * 1 * 1, self.comp_size * 2 * 1, 1, batch_first=True)
         # self.lstm = LSTM_ARCH(self.comp_size * 2,self.comp_size * 4 * 1, self.comp_size * 4 * 1 , lstm=self._lstm, dropout_rate=dropout)
@@ -7284,33 +7296,28 @@ class EmbConvLstPoly65(nn.Module):
 
     def forward(self, x, hidden):
 
-        notes = x[:, :, 0, :]
-        offsets = x[:, :, 1, :]
-        durations = x[:, :, 2, :]
-        velocities = x[:, :, 3, :]
+        notes = x[:, :, 0]
+        offsets = x[:, :, 1]
+        durations = x[:, :, 2]
+        velocities = x[:, :, 3]
 
         # dimenions of input x torch.Size([32, 64, 4, 6])
         # embedding shape not reshaped torch.Size([32, 64, 6])
 
-        note_embedd = self.note_embedd(notes).view(notes.shape[0], notes.shape[1], -1).permute(0, 2, 1)
-        offset_embedd = self.offset_embedd(offsets).view(offsets.shape[0], offsets.shape[1], -1).permute(0, 2, 1)
-        duration_embedd = self.duration_embedd(durations).view(durations.shape[0], durations.shape[1], -1).permute(0, 2,
-                                                                                                                   1)
-        velocity_embedd = self.velocity_embedd(velocities).view(velocities.shape[0], velocities.shape[1], -1).permute(0,
-                                                                                                                      2,
-                                                                                                                      1)
-
-        note_embedd = self.note_encode(note_embedd)
-        offset_embedd = self.offset_encode(offset_embedd)
-        duration_embedd = self.duration_encode(duration_embedd)
-        velocity_embedd = self.velocity_encode(velocity_embedd)
+        note_embedd = self.note_embedd(notes)
+        offset_embedd = self.offset_embedd(offsets)
+        duration_embedd = self.duration_embedd(durations)
+        velocity_embedd = self.velocity_embedd(velocities)
 
         embeddings = torch.cat((note_embedd, velocity_embedd, offset_embedd, duration_embedd), dim=1)
         # embeddings = embeddings.permute(0, 2, 1)  # shape [160, 32, 1024]
         embeddings = F.dropout(embeddings, self.dropout)
+
+        embeddings = self.bn(embeddings)
         embeddings = embeddings.permute(0, 2, 1)
         embeddings = self.embAttn(embeddings)
         embeddings = embeddings.permute(0, 2, 1)
+        embeddings = self.dense(embeddings)
 
         # Apply the convolutions separately to the input embeddings
         conv_out1 = self.conv1(embeddings)  # no padding required for kernel_size=1
@@ -10303,7 +10310,6 @@ class SimpleLstm(nn.Module):
     def __init__(self, note_data, dropout=0.3, bidirectional=False):
         super(SimpleLstm, self).__init__()
         self.dropout = dropout
-
         self.bidirectional = bidirectional
         self.note_data = note_data
         self.embedding_size1 = 32
@@ -10311,6 +10317,7 @@ class SimpleLstm(nn.Module):
         self.embedding_size3 = 32
         self.embedding_size4 = 32
 
+        # Embedding layers
         self.note_embedd = nn.Embedding(note_data.n_vocab, self.embedding_size1, padding_idx=0)
         self.offset_embedd = nn.Embedding(note_data.o_vocab, self.embedding_size2, padding_idx=0)
         self.duration_embedd = nn.Embedding(note_data.d_vocab, self.embedding_size3, padding_idx=0)
@@ -10321,11 +10328,12 @@ class SimpleLstm(nn.Module):
         self.comp_size = int(self.comp_size_mid / 2)
 
         self.dense = nn.Sequential(
+            nn.BatchNorm1d(self.in_size),
             nn.Linear(self.in_size, self.comp_size_mid),
             nn.ReLU(),
-            nn.Linear(self.comp_size_mid, self.comp_size),
-            nn.ReLU(),
         )
+
+        self.conv = nn.Conv1d(self.comp_size_mid, self.in_size, kernel_size=1)
 
         self.lstm = nn.LSTM(self.comp_size, self.comp_size * 4, 2, batch_first=True, dropout=self.dropout)
 
@@ -10366,6 +10374,12 @@ class SimpleLstm(nn.Module):
         offset_embedd = self.offset_embedd(offsets)
         duration_embedd = self.duration_embedd(durations)
         velocity_embedd = self.velocity_embedd(velocities)
+
+        # Apply batch normalization to embeddings
+        note_embedd = self.note_bn(note_embedd.permute(0, 2, 1)).permute(0, 2, 1)
+        offset_embedd = self.offset_bn(offset_embedd.permute(0, 2, 1)).permute(0, 2, 1)
+        duration_embedd = self.duration_bn(duration_embedd.permute(0, 2, 1)).permute(0, 2, 1)
+        velocity_embedd = self.velocity_bn(velocity_embedd.permute(0, 2, 1)).permute(0, 2, 1)
 
         embeddings = torch.cat((note_embedd, offset_embedd, duration_embedd, velocity_embedd), dim=2)
         embeddings = F.dropout(embeddings, self.dropout)
@@ -11047,7 +11061,7 @@ class CustomLSTMWithSelfAttention(nn.Module):
 
         self.in_size = self.embedding_size1 + self.embedding_size2 + self.embedding_size3 + self.embedding_size4
         self.comp_size_mid = int(self.in_size / 2)
-        self.comp_size = self.comp_size_mid #int(self.comp_size_mid / 2)
+        self.comp_size = self.comp_size_mid  # int(self.comp_size_mid / 2)
 
         self.dense = nn.Sequential(
             nn.Linear(self.in_size, self.comp_size_mid),
@@ -11059,9 +11073,8 @@ class CustomLSTMWithSelfAttention(nn.Module):
         self.lstm = nn.LSTM(self.comp_size, self.comp_size * 4, num_layers=2, batch_first=True, dropout=self.dropout,
                             bidirectional=self.bidirectional)
 
-
         # Adjust the input size of reduce_dim to match the concatenated output size
-       # self.reduce_dim = nn.Linear(self.comp_size * 4 * 2, self.comp_size * 4)
+        # self.reduce_dim = nn.Linear(self.comp_size * 4 * 2, self.comp_size * 4)
 
         self.reduce_dim = nn.Linear(self.comp_size * 4, self.comp_size * 2)
         self.self_attention = SelfAttention(self.comp_size * 2)
@@ -11072,9 +11085,10 @@ class CustomLSTMWithSelfAttention(nn.Module):
         self.fc_velocity = nn.Linear(self.comp_size * 2, note_data.v_vocab)
 
     def init_hidden(self, device, batch_size=256):
-        hidden = torch.zeros(4, batch_size, self.comp_size * 4, requires_grad=False).to(device)
-        cell = torch.zeros(4, batch_size, self.comp_size * 4, requires_grad=False).to(device)
-        return hidden, cell
+        num_directions = 2 if self.bidirectional else 1
+        hidden = (torch.zeros(num_directions * self.lstm.num_layers, batch_size, self.comp_size * 4).to(device),
+                  torch.zeros(num_directions * self.lstm.num_layers, batch_size, self.comp_size * 4).to(device))
+        return hidden
 
     def detach_hidden(self, hidden):
         hidden, cell = hidden
@@ -11083,7 +11097,7 @@ class CustomLSTMWithSelfAttention(nn.Module):
         return hidden, cell
 
     def forward(self, x, hidden):
-        #batch_size, seq_len, feature_dim = x.shape
+        # batch_size, seq_len, feature_dim = x.shape
 
         notes = x[:, :, 0]
         offsets = x[:, :, 1]
@@ -11105,13 +11119,9 @@ class CustomLSTMWithSelfAttention(nn.Module):
         lstm_out_last = lstm_out[:, -1, :]  # Output of the last time step
 
         # Apply self-attention
-        #lstm_out_last = lstm_out_last.unsqueeze(1)  # Adding sequence dimension for self-attention
-
-        reduced_output = self.reduce_dim(lstm_out_last)
-      #  lstm_out_last = reduced_output.unsqueeze(1)
-        context  = reduced_output
-        # context, attn_weights = self.self_attention(lstm_out_last)
-        # context = context.squeeze(1)  # Removing sequence dimension after attention
+        lstm_out_last = lstm_out_last.unsqueeze(1)  # Adding sequence dimension for self-attention
+        context, attn_weights = self.self_attention(lstm_out_last)
+        context = context.squeeze(1)  # Removing sequence dimension after attention
 
         # # lstm_out_last = lstm_out[:, -1, :]
         # # hidden_last = hidden[0][-1]  # Using the last layer hidden state
@@ -11133,5 +11143,632 @@ class CustomLSTMWithSelfAttention(nn.Module):
         offset_pred = self.fc_offset(context)
         duration_pred = self.fc_duration(context)
         velocity_pred = self.fc_velocity(context)
+
+        return note_pred, offset_pred, duration_pred, velocity_pred, hidden
+
+
+class SimpleLstm(nn.Module):
+    def __init__(self, note_data, dropout=0.3, bidirectional=False):
+        super(SimpleLstm, self).__init__()
+        self.dropout = dropout
+        self.bidirectional = bidirectional
+        self.note_data = note_data
+        self.embedding_size1 = 32
+        self.embedding_size2 = 32
+        self.embedding_size3 = 32
+        self.embedding_size4 = 32
+
+        # Embedding layers
+        self.note_embedd = nn.Embedding(note_data.n_vocab, self.embedding_size1, padding_idx=0)
+        self.offset_embedd = nn.Embedding(note_data.o_vocab, self.embedding_size2, padding_idx=0)
+        self.duration_embedd = nn.Embedding(note_data.d_vocab, self.embedding_size3, padding_idx=0)
+        self.velocity_embedd = nn.Embedding(note_data.v_vocab, self.embedding_size4, padding_idx=0)
+
+        # 2D CNN layers with kernel size 1 for each embedding
+        self.note_conv = nn.Conv2d(1, 1, kernel_size=(1, self.embedding_size1), stride=1)
+        self.offset_conv = nn.Conv2d(1, 1, kernel_size=(1, self.embedding_size2), stride=1)
+        self.duration_conv = nn.Conv2d(1, 1, kernel_size=(1, self.embedding_size3), stride=1)
+        self.velocity_conv = nn.Conv2d(1, 1, kernel_size=(1, self.embedding_size4), stride=1)
+
+        # Batch normalization layer for concatenated embeddings
+        self.concat_bn = nn.BatchNorm1d(
+            self.embedding_size1 + self.embedding_size2 + self.embedding_size3 + self.embedding_size4)
+
+        # Additional CNN layer with kernel size 1 for concatenated features
+        self.concat_conv = nn.Conv2d(1, 1, kernel_size=(
+            1, self.embedding_size1 + self.embedding_size2 + self.embedding_size3 + self.embedding_size4), stride=1)
+
+        self.in_size = self.embedding_size1 + self.embedding_size2 + self.embedding_size3 + self.embedding_size4
+        self.comp_size_mid = int(self.in_size / 2)
+        self.comp_size = int(self.comp_size_mid / 2)
+
+        self.dense = nn.Sequential(
+            nn.Linear(self.in_size, self.comp_size_mid),
+            nn.ReLU(),
+            nn.Linear(self.comp_size_mid, self.comp_size),
+            nn.ReLU(),
+        )
+
+        self.lstm = nn.LSTM(self.comp_size, self.comp_size * 4, 2, batch_first=True, dropout=self.dropout)
+
+        self.fc_note = nn.Linear(self.comp_size * 4, note_data.n_vocab)
+        self.fc_offset = nn.Linear(self.comp_size * 4, note_data.o_vocab)
+        self.fc_duration = nn.Linear(self.comp_size * 4, note_data.d_vocab)
+        self.fc_velocity = nn.Linear(self.comp_size * 4, note_data.v_vocab)
+
+        self._initialize_weights()
+
+    def init_hidden(self, device, batch_size=256):
+        hidden = torch.zeros(2, batch_size, self.comp_size * 4, requires_grad=False).to(device)
+        cell = torch.zeros(2, batch_size, self.comp_size * 4, requires_grad=False).to(device)
+        return hidden, cell
+
+    def detach_hidden(self, hidden):
+        hidden, cell = hidden
+        hidden = hidden.detach()
+        cell = cell.detach()
+        return hidden, cell
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x, hidden):
+        batch_size, seq_len, feature_dim = x.shape
+
+        notes = x[:, :, 0].unsqueeze(1)  # (batch_size, 1, seq_len)
+        offsets = x[:, :, 1].unsqueeze(1)
+        durations = x[:, :, 2].unsqueeze(1)
+        velocities = x[:, :, 3].unsqueeze(1)
+
+        note_embedd = self.note_embedd(notes).permute(0, 3, 1, 2)  # (batch_size, embedding_size1, 1, seq_len)
+        offset_embedd = self.offset_embedd(offsets).permute(0, 3, 1, 2)
+        duration_embedd = self.duration_embedd(durations).permute(0, 3, 1, 2)
+        velocity_embedd = self.velocity_embedd(velocities).permute(0, 3, 1, 2)
+
+        # Apply 2D CNN with kernel size 1
+        note_embedd = F.relu(self.note_conv(note_embedd)).squeeze(2)
+        offset_embedd = F.relu(self.offset_conv(offset_embedd)).squeeze(2)
+        duration_embedd = F.relu(self.duration_conv(duration_embedd)).squeeze(2)
+        velocity_embedd = F.relu(self.velocity_conv(velocity_embedd)).squeeze(2)
+
+        embeddings = torch.cat((note_embedd, offset_embedd, duration_embedd, velocity_embedd), dim=1)
+
+        # Apply batch normalization to concatenated embeddings
+        embeddings = self.concat_bn(embeddings.permute(0, 2, 1)).permute(0, 2, 1)
+
+        # Apply additional CNN with kernel size 1 to the concatenated embeddings
+        embeddings = F.relu(self.concat_conv(embeddings.unsqueeze(1))).squeeze(1)
+
+        # Optionally, apply larger kernels to capture temporal dependencies (e.g., kernel_size=(3, 3))
+        # embeddings = F.relu(self.larger_conv(embeddings.unsqueeze(1))).squeeze(1)
+
+        embeddings = F.dropout(embeddings, self.dropout)
+        embeddings = self.dense(embeddings)
+
+        lstm_out, hidden = self.lstm(embeddings, hidden)
+        lstm_out = lstm_out[:, -1, :]
+
+        note_pred = self.fc_note(lstm_out)
+        offset_pred = self.fc_offset(lstm_out)
+        duration_pred = self.fc_duration(lstm_out)
+        velocity_pred = self.fc_velocity(lstm_out)
+
+        return note_pred, offset_pred, duration_pred, velocity_pred, hidden
+
+
+class SimpleLstm(nn.Module):
+    def __init__(self, note_data, dropout=0.3, bidirectional=False):
+        super(SimpleLstm, self).__init__()
+        self.dropout = dropout
+        self.bidirectional = bidirectional
+        self.note_data = note_data
+        self.embedding_size1 = 8
+        self.embedding_size2 = 8
+        self.embedding_size3 = 8
+        self.embedding_size4 = 8
+
+        # Embedding layers
+        self.note_embedd = nn.Embedding(note_data.n_vocab, self.embedding_size1, padding_idx=0)
+        self.offset_embedd = nn.Embedding(note_data.o_vocab, self.embedding_size2, padding_idx=0)
+        self.duration_embedd = nn.Embedding(note_data.d_vocab, self.embedding_size3, padding_idx=0)
+        self.velocity_embedd = nn.Embedding(note_data.v_vocab, self.embedding_size4, padding_idx=0)
+
+        self.in_size = self.embedding_size1 + self.embedding_size2 + self.embedding_size3 + self.embedding_size4
+        self.out_size = self.in_size * 2
+
+        # Conv1D layers
+        self.single_conv = nn.Conv1d(self.in_size, self.out_size, kernel_size=1)
+        self.single_conv2 = nn.Conv1d(self.in_size, self.out_size, kernel_size=11, padding=5)
+
+        self.multi_conv1 = nn.Sequential(
+            nn.Conv1d(self.out_size, self.out_size, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Conv1d(self.out_size, self.out_size * 2, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.BatchNorm1d(self.out_size * 2),
+            nn.Dropout(self.dropout),
+            nn.Conv1d(self.out_size * 2, self.out_size, kernel_size=1, padding=0)
+        )
+
+        self.multi_conv2 = nn.Sequential(
+            nn.Conv1d(self.out_size, self.out_size, kernel_size=3, dilation=3, stride=4, padding=3),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Conv1d(self.out_size, self.out_size * 2, kernel_size=5, dilation=3, stride=4, padding=6),
+            nn.ReLU(),
+            nn.BatchNorm1d(self.out_size * 2),
+            nn.Dropout(self.dropout),
+            nn.Conv1d(self.out_size * 2, self.out_size, kernel_size=1, padding=0)
+        )
+
+        self.multi_conv3 = nn.Sequential(
+            nn.Conv1d(self.out_size, self.out_size, kernel_size=7, padding=3),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Conv1d(self.out_size, self.out_size * 2, kernel_size=9, padding=4),
+            nn.ReLU(),
+            nn.BatchNorm1d(self.out_size * 2),
+            nn.Dropout(self.dropout),
+            nn.Conv1d(self.out_size * 2, self.out_size, kernel_size=1, padding=0)
+        )
+
+        self.multi_conv4 = nn.Sequential(
+            nn.Conv1d(self.out_size, self.out_size, kernel_size=7, dilation=3, stride=4, padding=9),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Conv1d(self.out_size, self.out_size * 2, kernel_size=9, dilation=3, stride=4, padding=12),
+            nn.ReLU(),
+            nn.BatchNorm1d(self.out_size * 2),
+            nn.Dropout(self.dropout),
+            nn.Conv1d(self.out_size * 2, self.out_size, kernel_size=1, padding=0)
+        )
+
+        # LSTM layer
+        self.lstm = nn.LSTM(self.out_size * 6, self.out_size * 6, num_layers=4, batch_first=True, dropout=self.dropout,
+                            bidirectional=self.bidirectional)
+
+        # Dense layer
+        self.dense = nn.Sequential(
+            nn.Linear(self.out_size * 6 * 2 if self.bidirectional else self.out_size * 6, self.out_size * 2),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.out_size * 2, self.in_size),
+            nn.ReLU()
+        )
+
+        # Fully connected layers for final output
+        self.fc_note = nn.Linear(self.in_size, note_data.n_vocab)
+        self.fc_offset = nn.Linear(self.in_size, note_data.o_vocab)
+        self.fc_duration = nn.Linear(self.in_size, note_data.d_vocab)
+        self.fc_velocity = nn.Linear(self.in_size, note_data.v_vocab)
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def init_hidden(self, device, batch_size=256):
+        num_directions = 2 if self.bidirectional else 1
+        hidden = torch.zeros(4 * num_directions, batch_size, self.out_size * 6, requires_grad=False).to(device)
+        cell = torch.zeros(4 * num_directions, batch_size, self.out_size * 6, requires_grad=False).to(device)
+        return hidden, cell
+
+    def detach_hidden(self, hidden):
+        hidden, cell = hidden
+        hidden = hidden.detach()
+        cell = cell.detach()
+        return hidden, cell
+
+    def forward(self, x, hidden):
+        batch_size, seq_len, feature_dim = x.shape
+
+        notes = x[:, :, 0]
+        offsets = x[:, :, 1]
+        durations = x[:, :, 2]
+        velocities = x[:, :, 3]
+
+        # Embeddings
+        note_embedd = self.note_embedd(notes).permute(0, 2, 1)  # (batch_size, embedding_size1, seq_len)
+        offset_embedd = self.offset_embedd(offsets).permute(0, 2, 1)
+        duration_embedd = self.duration_embedd(durations).permute(0, 2, 1)
+        velocity_embedd = self.velocity_embedd(velocities).permute(0, 2, 1)
+
+        # Concatenate embeddings
+        embeddings = torch.cat((note_embedd, offset_embedd, duration_embedd, velocity_embedd), dim=1)
+
+        # Apply single Conv1D layers
+        single_conv_out1 = F.relu(self.single_conv(embeddings))
+        single_conv_out2 = F.relu(self.single_conv2(embeddings))
+
+        # Apply multi Conv1D layers to single_conv_out1
+        multi_conv_out1 = self.multi_conv1(single_conv_out1)
+        multi_conv_out2 = self.multi_conv2(single_conv_out1)
+        multi_conv_out3 = self.multi_conv3(single_conv_out1)
+        multi_conv_out4 = self.multi_conv4(single_conv_out1)
+
+        # Ensure the output dimensions match for concatenation
+        max_seq_len = min(single_conv_out1.size(2), single_conv_out2.size(2),
+                          multi_conv_out1.size(2), multi_conv_out2.size(2),
+                          multi_conv_out3.size(2), multi_conv_out4.size(2))
+
+        single_conv_out1 = single_conv_out1[:, :, :max_seq_len]
+        single_conv_out2 = single_conv_out2[:, :, :max_seq_len]
+        multi_conv_out1 = multi_conv_out1[:, :, :max_seq_len]
+        multi_conv_out2 = multi_conv_out2[:, :, :max_seq_len]
+        multi_conv_out3 = multi_conv_out3[:, :, :max_seq_len]
+        multi_conv_out4 = multi_conv_out4[:, :, :max_seq_len]
+
+        # Concatenate all Conv1D outputs
+        combined_conv_out = torch.cat((single_conv_out1, single_conv_out2,
+                                       multi_conv_out1, multi_conv_out2,
+                                       multi_conv_out3, multi_conv_out4), dim=1)
+
+        # Add embedding concatenation to combined Conv1D outputs
+
+        # LSTM layer
+        lstm_out, hidden = self.lstm(combined_conv_out.permute(0, 2, 1), hidden)
+        lstm_out = lstm_out[:, -1, :]  # Use the output of the last time step
+
+        # Dense layer
+        dense_out = self.dense(lstm_out)
+
+        # Fully connected layers
+        note_pred = self.fc_note(dense_out)
+        offset_pred = self.fc_offset(dense_out)
+        duration_pred = self.fc_duration(dense_out)
+        velocity_pred = self.fc_velocity(dense_out)
+
+        return note_pred, offset_pred, duration_pred, velocity_pred, hidden
+
+
+class AdvancedLstmModel(nn.Module):
+    def __init__(self, note_data, dropout=0.3, bidirectional=False):
+        super(AdvancedLstmModel, self).__init__()
+        self.dropout = dropout
+        self.bidirectional = bidirectional
+        self.note_data = note_data
+        self.embedding_size1 = 8
+        self.embedding_size2 = 8
+        self.embedding_size3 = 8
+        self.embedding_size4 = 8
+
+        # Embedding layers
+        self.note_embedd = nn.Embedding(note_data.n_vocab, self.embedding_size1, padding_idx=0)
+        self.offset_embedd = nn.Embedding(note_data.o_vocab, self.embedding_size2, padding_idx=0)
+        self.duration_embedd = nn.Embedding(note_data.d_vocab, self.embedding_size3, padding_idx=0)
+        self.velocity_embedd = nn.Embedding(note_data.v_vocab, self.embedding_size4, padding_idx=0)
+
+        self.in_size = self.embedding_size1 + self.embedding_size2 + self.embedding_size3 + self.embedding_size4
+        self.out_size = self.in_size * 2
+
+        # Convolutional layers
+        self.single_conv = nn.Conv1d(self.in_size, self.out_size, kernel_size=1)
+        self.single_conv2 = nn.Conv1d(self.in_size, self.out_size, kernel_size=11, padding=5)
+
+        # Pointwise convolution to match dimensions
+        self.match_conv = nn.Conv1d(self.in_size, self.out_size * 2, kernel_size=1)
+
+        # Multi-Head Attention
+        self.multihead_attn = nn.MultiheadAttention(embed_dim=self.out_size * 8, num_heads=4, dropout=self.dropout)
+
+        # Multi-Layer LSTM
+        self.lstm = nn.LSTM(self.out_size * 8, self.out_size * 8, num_layers=4, batch_first=True, dropout=self.dropout, bidirectional=False)
+
+        self.dense = nn.Sequential(
+            nn.Linear(self.out_size * 8, self.out_size * 4),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.out_size * 4, self.out_size * 2),
+            nn.Dropout(self.dropout),
+            nn.ReLU(),
+            nn.Linear(self.out_size * 2, self.in_size),
+            nn.ReLU(),
+        )
+
+        # Dense layers for final output
+        self.fc_note = nn.Linear(self.in_size, note_data.n_vocab)
+        self.fc_offset = nn.Linear(self.in_size, note_data.o_vocab)
+        self.fc_duration = nn.Linear(self.in_size, note_data.d_vocab)
+        self.fc_velocity = nn.Linear(self.in_size, note_data.v_vocab)
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d) or isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def init_hidden(self, device, batch_size=256):
+        hidden = torch.zeros(4, batch_size, self.out_size * 8, requires_grad=False).to(device)
+        cell = torch.zeros(4, batch_size, self.out_size * 8, requires_grad=False).to(device)
+        return hidden, cell
+
+    def detach_hidden(self, hidden):
+        hidden, cell = hidden
+        hidden = hidden.detach()
+        cell = cell.detach()
+        return hidden, cell
+
+    def forward(self, x, hidden=None):
+        batch_size, seq_len, feature_dim = x.shape
+
+        # Split x into the four features
+        note = x[:, :, 0]
+        offset = x[:, :, 1]
+        duration = x[:, :, 2]
+        velocity = x[:, :, 3]
+
+        note_emb = self.note_embedd(note)
+        offset_emb = self.offset_embedd(offset)
+        duration_emb = self.duration_embedd(duration)
+        velocity_emb = self.velocity_embedd(velocity)
+
+        # Concatenate embeddings
+        x = torch.cat((note_emb, offset_emb, duration_emb, velocity_emb), dim=-1).transpose(1, 2)
+
+        # Pass through the initial single convolution
+        single_conv_out = self.single_conv(x)
+        single_conv2_out = self.single_conv2(x)
+
+        # Concatenate convolution outputs
+        conv_out = torch.cat((single_conv_out, single_conv2_out), dim=1)
+
+        # Adjust dimensions of x to match conv_out
+        x_matched = self.match_conv(x)
+
+        # Add original embedding to the concatenation (residual connection)
+        embed_out = x_matched + conv_out
+
+        # Prepare for multi-head attention
+        embed_out = embed_out.transpose(0, 1)  # Required for multi-head attention
+
+        # Multi-Head Attention
+        attn_output, _ = self.multihead_attn(embed_out, embed_out, embed_out)
+
+        # Pass through LSTM
+        lstm_out, hidden = self.lstm(attn_output.transpose(0, 1), hidden)
+
+        # Take the last output of the LSTM
+        lstm_out = lstm_out[:, -1, :]
+
+        # Pass through dense layers
+        lstm_out = self.dense(lstm_out)
+
+        # Final output layers
+        note_out = self.fc_note(lstm_out)
+        offset_out = self.fc_offset(lstm_out)
+        duration_out = self.fc_duration(lstm_out)
+        velocity_out = self.fc_velocity(lstm_out)
+
+        return note_out, offset_out, duration_out, velocity_out, hidden
+
+
+
+class SimpleLstm(nn.Module):
+    def __init__(self, note_data, dropout=0.3, bidirectional=False):
+        super(SimpleLstm, self).__init__()
+        self.dropout = dropout
+        self.bidirectional = bidirectional
+        self.note_data = note_data
+        self.hidden_size = 128
+
+        # Embedding layers
+        self.note_embedd = nn.Embedding(note_data.n_vocab, 32, padding_idx=0)
+        self.offset_embedd = nn.Embedding(note_data.o_vocab, 32, padding_idx=0)
+        self.duration_embedd = nn.Embedding(note_data.d_vocab, 32, padding_idx=0)
+        self.velocity_embedd = nn.Embedding(note_data.v_vocab, 32, padding_idx=0)
+
+        # LSTMs for each feature
+        self.lstm_note = nn.LSTM(32, self.hidden_size, num_layers=2, batch_first=True, dropout=self.dropout, bidirectional=self.bidirectional)
+        self.lstm_offset = nn.LSTM(32, self.hidden_size, num_layers=2, batch_first=True, dropout=self.dropout, bidirectional=self.bidirectional)
+        self.lstm_duration = nn.LSTM(32, self.hidden_size, num_layers=2, batch_first=True, dropout=self.dropout, bidirectional=self.bidirectional)
+        self.lstm_velocity = nn.LSTM(32, self.hidden_size, num_layers=2, batch_first=True, dropout=self.dropout, bidirectional=self.bidirectional)
+
+        # Final LSTM after concatenation
+        self.final_lstm = nn.LSTM(self.hidden_size * 4, self.hidden_size, num_layers=2, batch_first=True, dropout=self.dropout, bidirectional=self.bidirectional)
+
+        # Fully connected layers for final output
+        self.fc_note = nn.Linear(self.hidden_size * 2 if self.bidirectional else self.hidden_size, note_data.n_vocab)
+        self.fc_offset = nn.Linear(self.hidden_size * 2 if self.bidirectional else self.hidden_size, note_data.o_vocab)
+        self.fc_duration = nn.Linear(self.hidden_size * 2 if self.bidirectional else self.hidden_size, note_data.d_vocab)
+        self.fc_velocity = nn.Linear(self.hidden_size * 2 if self.bidirectional else self.hidden_size, note_data.v_vocab)
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def init_hidden(self, device, batch_size=256):
+        num_directions = 2 if self.bidirectional else 1
+        hidden = (torch.zeros(2 * num_directions, batch_size, self.hidden_size).to(device),
+                  torch.zeros(2 * num_directions, batch_size, self.hidden_size).to(device))
+        return hidden
+
+
+    def detach_hidden(self, hidden):
+        hidden, cell = hidden
+        hidden = hidden.detach()
+        cell = cell.detach()
+        return hidden, cell
+
+
+    def forward(self, x, hidden):
+        batch_size, seq_len, feature_dim = x.shape
+
+        notes = x[:, :, 0]
+        offsets = x[:, :, 1]
+        durations = x[:, :, 2]
+        velocities = x[:, :, 3]
+
+        # Embeddings
+        note_embedd = self.note_embedd(notes)
+        offset_embedd = self.offset_embedd(offsets)
+        duration_embedd = self.duration_embedd(durations)
+        velocity_embedd = self.velocity_embedd(velocities)
+
+        # LSTM for each feature
+        _, (hidden_note, _) = self.lstm_note(note_embedd)
+        _, (hidden_offset, _) = self.lstm_offset(offset_embedd)
+        _, (hidden_duration, _) = self.lstm_duration(duration_embedd)
+        _, (hidden_velocity, _) = self.lstm_velocity(velocity_embedd)
+
+        # Concatenate hidden states
+        hidden_concat = torch.cat((hidden_note[-1], hidden_offset[-1], hidden_duration[-1], hidden_velocity[-1]), dim=1).unsqueeze(1)
+
+        # Final LSTM
+        lstm_out, hidden_final = self.final_lstm(hidden_concat)
+
+        # Use the output of the last time step
+        lstm_out = lstm_out[:, -1, :]
+
+        # Fully connected layers
+        note_pred = self.fc_note(lstm_out)
+        offset_pred = self.fc_offset(lstm_out)
+        duration_pred = self.fc_duration(lstm_out)
+        velocity_pred = self.fc_velocity(lstm_out)
+
+        return note_pred, offset_pred, duration_pred, velocity_pred, hidden_final
+
+
+
+# class CRNNModel(nn.Module):
+#     def __init__(self, note_data, hidden_dim, num_layers):
+#         super(CRNNModel, self).__init__()
+#         self.hidden_dim = hidden_dim
+#         self.embedding_note = nn.Embedding(note_data.n_vocab, hidden_dim, padding_idx=0)
+#         self.embedding_offset = nn.Embedding(note_data.o_vocab, hidden_dim, padding_idx=0)
+#         self.embedding_duration = nn.Embedding(note_data.d_vocab, hidden_dim, padding_idx=0)
+#         self.embedding_velocity = nn.Embedding(note_data.v_vocab, hidden_dim, padding_idx=0)
+#
+#         self.conv1 = nn.Conv1d(hidden_dim * 4, hidden_dim * 8, kernel_size=3, padding=1)
+#         self.conv2 = nn.Conv1d(hidden_dim * 8, hidden_dim * 16, kernel_size=3, padding=1)
+#
+#         self.lstm = nn.LSTM(hidden_dim * 16, hidden_dim, num_layers, batch_first=True)
+#
+#         self.fc_note = nn.Linear(hidden_dim, note_data.n_vocab)
+#         self.fc_offset = nn.Linear(hidden_dim, note_data.o_vocab)
+#         self.fc_duration = nn.Linear(hidden_dim, note_data.d_vocab)
+#         self.fc_velocity = nn.Linear(hidden_dim, note_data.v_vocab)
+#
+#     def _initialize_weights(self):
+#         for m in self.modules():
+#             if isinstance(m, nn.Linear):
+#                 nn.init.xavier_normal_(m.weight)
+#                 if m.bias is not None:
+#                     nn.init.zeros_(m.bias)
+#
+#     def init_hidden(self, device, batch_size=256):
+#         num_directions = 1 # 2 if self.bidirectional else 1
+#         hidden = (torch.zeros(2 * num_directions, batch_size, self.hidden_dim * 16).to(device),
+#                   torch.zeros(2 * num_directions, batch_size, self.hidden_dim * 16).to(device))
+#         return hidden
+#
+#
+#     def detach_hidden(self, hidden):
+#         hidden, cell = hidden
+#         hidden = hidden.detach()
+#         cell = cell.detach()
+#         return hidden, cell
+#
+#     def forward(self, x, hidden):
+#         batch_size, seq_len, feature_dim = x.shape
+#
+#         notes = self.embedding_note(x[:, :, 0])
+#         offsets = self.embedding_offset(x[:, :, 1])
+#         durations = self.embedding_duration(x[:, :, 2])
+#         velocities = self.embedding_velocity(x[:, :, 3])
+#
+#         combined = torch.cat((notes, offsets, durations, velocities), dim=2)
+#         combined = combined.permute(0, 2, 1)  # For Conv1d, input should be (batch_size, feature_dim, seq_len)
+#
+#         conv_out = F.relu(self.conv1(combined))
+#         conv_out = F.relu(self.conv2(conv_out))
+#
+#         conv_out = conv_out.permute(0, 2, 1)  # For LSTM, input should be (batch_size, seq_len, feature_dim)
+#         lstm_out, hidden = self.lstm(conv_out, hidden)
+#
+#         self.fc_note = nn.Linear(hidden_dim, note_data.n_vocab)
+#         self.fc_offset = nn.Linear(hidden_dim, note_data.o_vocab)
+#         self.fc_duration = nn.Linear(hidden_dim, note_data.d_vocab)
+#         self.fc_velocity = nn.Linear(hidden_dim, note_data.v_vocab)
+#
+#         return note_pred, offset_pred, duration_pred, velocity_pred, hidden
+
+class MultiInputLSTMWithAttention(nn.Module):
+    def __init__(self, note_data, hidden_dim, num_layers):
+        super(MultiInputLSTMWithAttention, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+
+        self.embedding_note = nn.Embedding(note_data.n_vocab, hidden_dim, padding_idx=0)
+        self.embedding_offset = nn.Embedding(note_data.o_vocab, hidden_dim, padding_idx=0)
+        self.embedding_duration = nn.Embedding(note_data.d_vocab, hidden_dim, padding_idx=0)
+        self.embedding_velocity = nn.Embedding(note_data.v_vocab, hidden_dim, padding_idx=0)
+
+        self.lstm_note = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True)
+        self.lstm_offset = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True)
+        self.lstm_duration = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True)
+        self.lstm_velocity = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True)
+
+        self.attention = nn.MultiheadAttention(hidden_dim * 4, num_heads=4, batch_first=True)
+
+        self.fc_note = nn.Linear(hidden_dim * 4, note_data.n_vocab)
+        self.fc_offset = nn.Linear(hidden_dim * 4, note_data.o_vocab)
+        self.fc_duration = nn.Linear(hidden_dim * 4, note_data.d_vocab)
+        self.fc_velocity = nn.Linear(hidden_dim * 4, note_data.v_vocab)
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def init_hidden(self, device, batch_size=256):
+        num_directions = 1  # 2 if bidirectional, here it's not
+        hidden = (torch.zeros(num_directions * self.num_layers, batch_size, self.hidden_dim).to(device),
+                  torch.zeros(num_directions * self.num_layers, batch_size, self.hidden_dim).to(device))
+        return hidden
+
+    def detach_hidden(self, hidden):
+        hidden, cell = hidden
+        hidden = hidden.detach()
+        cell = cell.detach()
+        return hidden, cell
+
+    def forward(self, x, hidden):
+        batch_size, seq_len, feature_dim = x.shape
+
+        notes = self.embedding_note(x[:, :, 0])
+        offsets = self.embedding_offset(x[:, :, 1])
+        durations = self.embedding_duration(x[:, :, 2])
+        velocities = self.embedding_velocity(x[:, :, 3])
+
+        lstm_out_note, hidden_note = self.lstm_note(notes, hidden)
+        lstm_out_offset, hidden_offset = self.lstm_offset(offsets, hidden)
+        lstm_out_duration, hidden_duration = self.lstm_duration(durations, hidden)
+        lstm_out_velocity, hidden_velocity = self.lstm_velocity(velocities, hidden)
+
+        combined = torch.cat((lstm_out_note, lstm_out_offset, lstm_out_duration, lstm_out_velocity), dim=2)
+        attn_output, attn_weights = self.attention(combined, combined, combined)
+
+        # Ensure the output shape matches (batch_size * seq_len, vocab_size)
+        note_pred = self.fc_note(attn_output).reshape(batch_size * seq_len, -1)
+        offset_pred = self.fc_offset(attn_output).reshape(batch_size * seq_len, -1)
+        duration_pred = self.fc_duration(attn_output).reshape(batch_size * seq_len, -1)
+        velocity_pred = self.fc_velocity(attn_output).reshape(batch_size * seq_len, -1)
 
         return note_pred, offset_pred, duration_pred, velocity_pred, hidden

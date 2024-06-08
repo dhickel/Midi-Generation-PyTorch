@@ -247,6 +247,11 @@ def get_notes_single(directory, max_chan, get_flat=True):
 #                        network_output_velocities)
 
 
+
+def normalize_data(data, min_val, max_val):
+    return (data - min_val) / (max_val - min_val) * 2 - 1
+
+
 def prepare_sequences(note_data, device=torch.device("cuda"), sequence_length=64, skip_amount=1):
     network_input = []
     network_output_notes = []
@@ -1369,16 +1374,21 @@ def evaluate(model, val_loader, criterion, device, note_data, batch_size):
     return (running_loss / len(val_loader.dataset)) / 4, accuracy
 
 
-
-def train(model, train_loader, criterion, optimizer, device, batch_size, scheduler=None, clip_value=None):
+def train(model, train_loader, note_data, criterion, optimizer, device, scaler, batch_size, loss_weights,
+          scheduler=None, clip_value=None):
     model.train()
     running_loss = 0.0
-    total_predictions = 0
+    running_loss_note = 0.0
+    running_loss_offset = 0.0
+    running_loss_duration = 0.0
+    running_loss_velocity = 0.0
     correct_predictions = 0
+    total_predictions = 0
 
     for inputs, (targets_note, targets_offset, targets_duration, targets_velocity) in tqdm(train_loader):
-        optimizer.zero_grad()
-        hidden = model.init_hidden(device, batch_size)
+        # Initialize and detach hidden state
+        hidden = model.init_hidden(device, batch_size=batch_size)
+        hidden = model.detach_hidden(hidden)
 
         inputs = inputs.to(device)
         targets_note = targets_note.to(device)
@@ -1386,47 +1396,69 @@ def train(model, train_loader, criterion, optimizer, device, batch_size, schedul
         targets_duration = targets_duration.to(device)
         targets_velocity = targets_velocity.to(device)
 
-        # Forward pass
-        output_note, output_offset, output_duration, output_velocity, hidden = model(inputs, hidden)
+        optimizer.zero_grad()
 
-        # Element-wise loss for each feature
-        loss_note = criterion(output_note, targets_note)
-        loss_offset = criterion(output_offset, targets_offset)
-        loss_duration = criterion(output_duration, targets_duration)
-        loss_velocity = criterion(output_velocity, targets_velocity)
+        # Forward pass with autocast for mixed precision
+        with autocast():
+            output_note, output_offset, output_duration, output_velocity, hidden = model(inputs, hidden)
 
-        # Calculate accuracy
-        _, predicted_notes = torch.max(output_note.data, 1)
-        _, predicted_offsets = torch.max(output_offset.data, 1)
-        _, predicted_durations = torch.max(output_duration.data, 1)
-        _, predicted_velocities = torch.max(output_velocity.data, 1)
+            # Calculate individual losses
+            loss_note = criterion(output_note.view(-1, note_data.n_vocab), targets_note.view(-1).long()) * loss_weights[
+                'note']
+            loss_offset = criterion(output_offset.view(-1, note_data.o_vocab), targets_offset.view(-1).long()) * \
+                          loss_weights['offset']
+            loss_duration = criterion(output_duration.view(-1, note_data.d_vocab), targets_duration.view(-1).long()) * \
+                            loss_weights['duration']
+            loss_velocity = criterion(output_velocity.view(-1, note_data.v_vocab), targets_velocity.view(-1).long()) * \
+                            loss_weights['velocity']
 
+            # Total loss is the sum of all individual weighted losses
+            loss = loss_note + loss_offset + loss_duration + loss_velocity
+
+        # Backward pass and optimization
+        scaler.scale(loss).backward()
+
+        # Gradient clipping
+        if clip_value is not None:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
+
+        scaler.step(optimizer)
+        scaler.update()
+
+        if scheduler is not None:
+            scheduler.step()
+
+        running_loss += loss.item() * inputs.size(0)
+        running_loss_note += loss_note.item() * inputs.size(0)
+        running_loss_offset += loss_offset.item() * inputs.size(0)
+        running_loss_duration += loss_duration.item() * inputs.size(0)
+        running_loss_velocity += loss_velocity.item() * inputs.size(0)
+
+        # Calculate accuracy for each output
+        _, predicted_notes = torch.max(output_note, 1)
+        _, predicted_offsets = torch.max(output_offset, 1)
+        _, predicted_durations = torch.max(output_duration, 1)
+        _, predicted_velocities = torch.max(output_velocity, 1)
+
+        total_predictions += targets_note.size(0)  # Total samples per batch
         correct_predictions += (predicted_notes == targets_note).sum().item()
         correct_predictions += (predicted_offsets == targets_offset).sum().item()
         correct_predictions += (predicted_durations == targets_duration).sum().item()
         correct_predictions += (predicted_velocities == targets_velocity).sum().item()
 
-        total_predictions += targets_note.numel()
-        total_predictions += targets_offset.numel()
-        total_predictions += targets_duration.numel()
-        total_predictions += targets_velocity.numel()
+    # Calculate average loss and accuracy
+    avg_loss = running_loss / (len(train_loader.dataset) * 4)
+    avg_loss_note = running_loss_note / len(train_loader.dataset)
+    avg_loss_offset = running_loss_offset / len(train_loader.dataset)
+    avg_loss_duration = running_loss_duration / len(train_loader.dataset)
+    avg_loss_velocity = running_loss_velocity / len(train_loader.dataset)
+    accuracy = correct_predictions / (total_predictions * 4)
 
-        loss = loss_note + loss_offset + loss_duration + loss_velocity
+    print(
+        f"Loss Note: {avg_loss_note:.4f}, Loss Offset: {avg_loss_offset:.4f}, Loss Duration: {avg_loss_duration:.4f}, Loss Velocity: {avg_loss_velocity:.4f}")
 
-        # Backward pass and optimize
-        loss.backward()
-        if clip_value is not None:  # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
-        optimizer.step()
-
-        if scheduler is not None:
-            scheduler.step(loss)
-
-        running_loss += loss.item() * inputs.size(0)
-
-    accuracy = correct_predictions / total_predictions
-
-    return running_loss / len(train_loader.dataset), accuracy
+    return avg_loss, accuracy
 
 def evaluate(model, val_loader, criterion, device, batch_size):
     model.eval()
@@ -1476,3 +1508,242 @@ def evaluate(model, val_loader, criterion, device, batch_size):
     accuracy = correct_predictions / total_predictions
 
     return running_loss / len(val_loader.dataset), accuracy
+
+
+def evaluate(model, val_loader, note_data, criterion, device, batch_size, loss_weights):
+    model.eval()
+    running_loss = 0.0
+    running_loss_note = 0.0
+    running_loss_offset = 0.0
+    running_loss_duration = 0.0
+    running_loss_velocity = 0.0
+    total_predictions = 0
+    correct_predictions = 0
+
+    with torch.no_grad():
+        for inputs, (targets_note, targets_offset, targets_duration, targets_velocity) in tqdm(val_loader):
+            hidden = model.init_hidden(device, batch_size)
+            hidden = model.detach_hidden(hidden)
+
+            inputs = inputs.to(device)
+            targets_note = targets_note.to(device)
+            targets_offset = targets_offset.to(device)
+            targets_duration = targets_duration.to(device)
+            targets_velocity = targets_velocity.to(device)
+
+            # Forward pass
+            output_note, output_offset, output_duration, output_velocity, hidden = model(inputs, hidden)
+
+            # Calculate individual losses with weights
+            loss_note = criterion(output_note.view(-1, note_data.n_vocab), targets_note.view(-1).long()) * loss_weights['note']
+            loss_offset = criterion(output_offset.view(-1, note_data.o_vocab), targets_offset.view(-1).long()) * loss_weights['offset']
+            loss_duration = criterion(output_duration.view(-1, note_data.d_vocab), targets_duration.view(-1).long()) * loss_weights['duration']
+            loss_velocity = criterion(output_velocity.view(-1, note_data.v_vocab), targets_velocity.view(-1).long()) * loss_weights['velocity']
+
+            # Total loss is the sum of all individual weighted losses
+            loss = loss_note + loss_offset + loss_duration + loss_velocity
+
+            running_loss += loss.item() * inputs.size(0)
+            running_loss_note += loss_note.item() * inputs.size(0)
+            running_loss_offset += loss_offset.item() * inputs.size(0)
+            running_loss_duration += loss_duration.item() * inputs.size(0)
+            running_loss_velocity += loss_velocity.item() * inputs.size(0)
+
+            # Calculate accuracy for each output
+            _, predicted_notes = torch.max(output_note.data, 1)
+            _, predicted_offsets = torch.max(output_offset.data, 1)
+            _, predicted_durations = torch.max(output_duration.data, 1)
+            _, predicted_velocities = torch.max(output_velocity.data, 1)
+
+            total_predictions += targets_note.size(0)
+            correct_predictions += (predicted_notes == targets_note).sum().item()
+            correct_predictions += (predicted_offsets == targets_offset).sum().item()
+            correct_predictions += (predicted_durations == targets_duration).sum().item()
+            correct_predictions += (predicted_velocities == targets_velocity).sum().item()
+
+    avg_loss = running_loss / (len(val_loader.dataset) * 4)
+    avg_loss_note = running_loss_note / len(val_loader.dataset)
+    avg_loss_offset = running_loss_offset / len(val_loader.dataset)
+    avg_loss_duration = running_loss_duration / len(val_loader.dataset)
+    avg_loss_velocity = running_loss_velocity / len(val_loader.dataset)
+    accuracy = correct_predictions / (total_predictions * 4)
+
+    #print(f"Val Loss Note: {avg_loss_note:.4f}, Val Loss Offset: {avg_loss_offset:.4f}, Val Loss Duration: {avg_loss_duration:.4f}, Val Loss Velocity: {avg_loss_velocity:.4f}")
+
+    return avg_loss, accuracy
+
+
+def train(model, train_loader, note_data, criterion, optimizer, device, scaler, batch_size, loss_weights,
+          scheduler=None, clip_value=None):
+    model.train()
+    running_loss = 0.0
+    running_loss_note = 0.0
+    running_loss_offset = 0.0
+    running_loss_duration = 0.0
+    running_loss_velocity = 0.0
+    correct_predictions = 0
+    total_predictions = 0
+
+    for inputs, (targets_note, targets_offset, targets_duration, targets_velocity) in tqdm(train_loader):
+        # Initialize and detach hidden state
+        hidden = model.init_hidden(device, batch_size=batch_size)
+        hidden = model.detach_hidden(hidden)
+
+        inputs = inputs.to(device)
+        targets_note = targets_note.to(device)
+        targets_offset = targets_offset.to(device)
+        targets_duration = targets_duration.to(device)
+        targets_velocity = targets_velocity.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass with autocast for mixed precision
+        with autocast():
+            output_note, output_offset, output_duration, output_velocity, hidden = model(inputs, hidden)
+
+            # Calculate individual losses
+            loss_note = criterion(output_note.view(-1, note_data.n_vocab), targets_note.view(-1).long()) * loss_weights[
+                'note']
+            loss_offset = criterion(output_offset.view(-1, note_data.o_vocab), targets_offset.view(-1).long()) * \
+                          loss_weights['offset']
+            loss_duration = criterion(output_duration.view(-1, note_data.d_vocab), targets_duration.view(-1).long()) * \
+                            loss_weights['duration']
+            loss_velocity = criterion(output_velocity.view(-1, note_data.v_vocab), targets_velocity.view(-1).long()) * \
+                            loss_weights['velocity']
+
+            # Total loss is the sum of all individual weighted losses
+            loss = loss_note + loss_offset + loss_duration + loss_velocity
+
+        # Backward pass and optimization
+        scaler.scale(loss).backward()
+
+        # Gradient clipping
+        if clip_value is not None:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
+
+        scaler.step(optimizer)
+        scaler.update()
+
+        if scheduler is not None:
+            scheduler.step()
+
+        running_loss += loss.item() * inputs.size(0)
+        running_loss_note += loss_note.item() * inputs.size(0)
+        running_loss_offset += loss_offset.item() * inputs.size(0)
+        running_loss_duration += loss_duration.item() * inputs.size(0)
+        running_loss_velocity += loss_velocity.item() * inputs.size(0)
+
+        # Calculate accuracy for each output
+        _, predicted_notes = torch.max(output_note, 1)
+        _, predicted_offsets = torch.max(output_offset, 1)
+        _, predicted_durations = torch.max(output_duration, 1)
+        _, predicted_velocities = torch.max(output_velocity, 1)
+
+        total_predictions += targets_note.size(0)  # Total samples per batch
+        correct_predictions += (predicted_notes == targets_note).sum().item()
+        correct_predictions += (predicted_offsets == targets_offset).sum().item()
+        correct_predictions += (predicted_durations == targets_duration).sum().item()
+        correct_predictions += (predicted_velocities == targets_velocity).sum().item()
+
+    # Calculate average loss and accuracy
+    avg_loss = running_loss / (len(train_loader.dataset) * 4)
+    avg_loss_note = running_loss_note / len(train_loader.dataset)
+    avg_loss_offset = running_loss_offset / len(train_loader.dataset)
+    avg_loss_duration = running_loss_duration / len(train_loader.dataset)
+    avg_loss_velocity = running_loss_velocity / len(train_loader.dataset)
+    accuracy = correct_predictions / (total_predictions * 4)
+
+    print(
+        f"Loss Note: {avg_loss_note:.4f}, Loss Offset: {avg_loss_offset:.4f}, Loss Duration: {avg_loss_duration:.4f}, Loss Velocity: {avg_loss_velocity:.4f}")
+
+    return avg_loss, accuracy
+
+
+def train(model, train_loader, note_data, criterion, optimizer, device, scaler, batch_size, loss_weights,
+          scheduler=None, clip_value=None):
+    model.train()
+    running_loss = 0.0
+    running_loss_note = 0.0
+    running_loss_offset = 0.0
+    running_loss_duration = 0.0
+    running_loss_velocity = 0.0
+    correct_predictions = 0
+    total_predictions = 0
+
+    for inputs, (targets_note, targets_offset, targets_duration, targets_velocity) in tqdm(train_loader):
+        # Initialize and detach hidden state
+        hidden = model.init_hidden(device, batch_size=batch_size)
+        hidden = model.detach_hidden(hidden)
+
+        inputs = inputs.to(device)
+        targets_note = targets_note.to(device)
+        targets_offset = targets_offset.to(device)
+        targets_duration = targets_duration.to(device)
+        targets_velocity = targets_velocity.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass with autocast for mixed precision
+        with autocast():
+            output_note, output_offset, output_duration, output_velocity, hidden = model(inputs, hidden)
+
+            # Reshape targets to match the flattened predictions
+            targets_note = targets_note.view(-1)
+            targets_offset = targets_offset.view(-1)
+            targets_duration = targets_duration.view(-1)
+            targets_velocity = targets_velocity.view(-1)
+
+            # Calculate individual losses
+            loss_note = criterion(output_note, targets_note.long()) * loss_weights['note']
+            loss_offset = criterion(output_offset, targets_offset.long()) * loss_weights['offset']
+            loss_duration = criterion(output_duration, targets_duration.long()) * loss_weights['duration']
+            loss_velocity = criterion(output_velocity, targets_velocity.long()) * loss_weights['velocity']
+
+            # Total loss is the sum of all individual weighted losses
+            loss = loss_note + loss_offset + loss_duration + loss_velocity
+
+        # Backward pass and optimization
+        scaler.scale(loss).backward()
+
+        # Gradient clipping
+        if clip_value is not None:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
+
+        scaler.step(optimizer)
+        scaler.update()
+
+        if scheduler is not None:
+            scheduler.step()
+
+        running_loss += loss.item() * inputs.size(0)
+        running_loss_note += loss_note.item() * inputs.size(0)
+        running_loss_offset += loss_offset.item() * inputs.size(0)
+        running_loss_duration += loss_duration.item() * inputs.size(0)
+        running_loss_velocity += loss_velocity.item() * inputs.size(0)
+
+        # Calculate accuracy for each output
+        _, predicted_notes = torch.max(output_note, 1)
+        _, predicted_offsets = torch.max(output_offset, 1)
+        _, predicted_durations = torch.max(output_duration, 1)
+        _, predicted_velocities = torch.max(output_velocity, 1)
+
+        total_predictions += targets_note.size(0)  # Total samples per batch
+        correct_predictions += (predicted_notes == targets_note).sum().item()
+        correct_predictions += (predicted_offsets == targets_offset).sum().item()
+        correct_predictions += (predicted_durations == targets_duration).sum().item()
+        correct_predictions += (predicted_velocities == targets_velocity).sum().item()
+
+    # Calculate average loss and accuracy
+    avg_loss = running_loss / (len(train_loader.dataset) * 4)
+    avg_loss_note = running_loss_note / len(train_loader.dataset)
+    avg_loss_offset = running_loss_offset / len(train_loader.dataset)
+    avg_loss_duration = running_loss_duration / len(train_loader.dataset)
+    avg_loss_velocity = running_loss_velocity / len(train_loader.dataset)
+    accuracy = correct_predictions / (total_predictions * 4)
+
+    print(
+        f"Loss Note: {avg_loss_note:.4f}, Loss Offset: {avg_loss_offset:.4f}, Loss Duration: {avg_loss_duration:.4f}, Loss Velocity: {avg_loss_velocity:.4f}")
+
+    return avg_loss, accuracy
